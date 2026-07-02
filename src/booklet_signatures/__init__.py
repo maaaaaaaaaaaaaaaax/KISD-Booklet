@@ -5,8 +5,8 @@ Split a large, normally-sorted PDF (page 1, 2, 3, ...) into multiple
 saddle-stitch "signatures" (mini zines, e.g. 16 pages each), and reorder
 the pages of each signature into correct fold/imposition order.
 
-This does NOT place two pages side-by-side on one sheet (no 2-up layout)
-for the interior signatures. It only reorders single, full-size pages so
+By default this does NOT place two pages side-by-side on one sheet for
+the interior signatures. It only reorders single, full-size pages so
 that when you print each signature's output PDF using your print
 dialog's "2 pages per sheet" + duplex option, the physical sheets come
 out in the right sequence to fold, nest, and sew into a book with
@@ -14,13 +14,22 @@ signatures stacked on top of each other (the classic multi-signature
 bookbinding trick that keeps the middle from bulging the way one giant
 60+ page saddle-stitch does).
 
+Pass --imposed to instead have the script itself combine two source
+pages directly onto each output page (e.g. two A5 pages onto one
+A4-sized output page), so you don't need to configure "pages per sheet"
+in your print dialog at all -- just print each signature file
+double-sided at actual size.
+
 Optionally (--cover-sleeve), the first two and last two pages of the
 source document are pulled out of the interior signatures entirely and
 used to build a single wraparound cover sheet: back cover, blank spine,
 front cover on the outside; front-inner and back-inner pages on the
 reverse. That sheet is sized to wrap around the outside of all the
 sewn-together interior signatures, like a slipcover/dust-jacket, rather
-than being sewn through the middle with any one signature.
+than being sewn through the middle with any one signature. The cover
+sleeve is always built as a directly-imposed sheet, regardless of
+--imposed, since it needs the blank spine placed between the two panels
+either way.
 
 HOW THE INTERIOR SIGNATURE MATH WORKS
 --------------------------------------
@@ -33,7 +42,8 @@ compensate for the different flip axis.)
 
 Concatenating all sheets' front/back pairs in order (sheet 0 front,
 sheet 0 back, sheet 1 front, sheet 1 back, ...) and printing that
-sequence 2-up double-sided produces a correctly folding booklet.
+sequence 2-up double-sided (or, with --imposed, directly rendering each
+pair onto one output page) produces a correctly folding booklet.
 
 HOW THE COVER SLEEVE WORKS
 ---------------------------
@@ -62,28 +72,39 @@ import math
 import os
 import sys
 
-from pypdf import PdfReader, PdfWriter
-from pypdf import Transformation
+from pypdf import PdfReader, PdfWriter, Transformation
 
 MM_TO_PT = 2.834645669291339
 A3_LANDSCAPE_WIDTH_PT = 420 * MM_TO_PT
 A3_LANDSCAPE_HEIGHT_PT = 297 * MM_TO_PT
 
 
-def booklet_page_sequence(n: int, duplex: str = "long") -> list[int]:
-    """Return the linear sequence of 1-indexed local page numbers
-    (within a single signature of length n) in imposition/print order.
-    n must be a multiple of 4."""
+def booklet_page_pairs(n: int, duplex: str = "long") -> list[tuple[int, int]]:
+    """Return the list of (left, right) 1-indexed local page number pairs,
+    one pair per sheet side, in print order (sheet 0 front, sheet 0 back,
+    sheet 1 front, sheet 1 back, ...). n must be a multiple of 4."""
     assert n % 4 == 0, "signature size must be a multiple of 4"
-    sequence = []
+    pairs = []
     sheets = n // 4
     for i in range(sheets):
         front = (n - 2 * i, 2 * i + 1)
         back = (2 * i + 2, n - 2 * i - 1)
         if duplex == "short":
             back = (back[1], back[0])
-        sequence.extend(front)
-        sequence.extend(back)
+        pairs.append(front)
+        pairs.append(back)
+    return pairs
+
+
+def booklet_page_sequence(n: int, duplex: str = "long") -> list[int]:
+    """Return the linear sequence of 1-indexed local page numbers
+    (within a single signature of length n) in imposition/print order,
+    for use when NOT combining two pages onto one output sheet (i.e. you
+    rely on your print dialog's own "2 pages per sheet" option). n must
+    be a multiple of 4."""
+    sequence = []
+    for left, right in booklet_page_pairs(n, duplex=duplex):
+        sequence.extend((left, right))
     return sequence
 
 
@@ -103,8 +124,18 @@ def pad_to_multiple_of_4(n: int) -> int:
     return math.ceil(n / 4) * 4
 
 
-def build_signature_pdf(reader, start, end, duplex, out_path):
-    """Build one reordered, padded-if-needed signature PDF."""
+def build_signature_pdf(reader, start, end, duplex, out_path, imposed=False):
+    """Build one reordered, padded-if-needed signature PDF.
+
+    If imposed is False (default): one full-size source page per output
+    page, in fold order, for use with your print dialog's own "2 pages
+    per sheet" option.
+
+    If imposed is True: two source pages are combined directly onto
+    each output page, side by side at native size (e.g. two A5 pages
+    onto one A4-sized output page), so no "pages per sheet" print
+    setting is needed -- just duplex printing at actual size.
+    """
     real_pages = list(range(start, end + 1))  # 1-indexed source page numbers
     n_real = len(real_pages)
     n_padded = pad_to_multiple_of_4(n_real)
@@ -116,22 +147,36 @@ def build_signature_pdf(reader, start, end, duplex, out_path):
     for local_i, src_page in enumerate(real_pages, start=1):
         local_map[local_i] = src_page - 1  # 0-indexed
     for local_i in range(n_real + 1, n_padded + 1):
-        local_map[local_i] = None  # blank filler, goes at the very end (last local pages)
+        local_map[local_i] = (
+            None  # blank filler, goes at the very end (last local pages)
+        )
 
-    sequence = booklet_page_sequence(n_padded, duplex=duplex)
-
-    # Determine a blank page size from the source doc
-    sample_page = reader.pages[0]
-    blank_w = float(sample_page.mediabox.width)
-    blank_h = float(sample_page.mediabox.height)
+    # Determine page size from the first real page in this signature
+    sample_idx = next(v for v in local_map.values() if v is not None)
+    page_w = float(reader.pages[sample_idx].mediabox.width)
+    page_h = float(reader.pages[sample_idx].mediabox.height)
 
     writer = PdfWriter()
-    for local_num in sequence:
-        src_idx = local_map[local_num]
-        if src_idx is None:
-            writer.add_blank_page(width=blank_w, height=blank_h)
-        else:
-            writer.add_page(reader.pages[src_idx])
+
+    if imposed:
+        pairs = booklet_page_pairs(n_padded, duplex=duplex)
+        for left_num, right_num in pairs:
+            out_page = writer.add_blank_page(width=page_w * 2, height=page_h)
+            for local_num, x_offset in ((left_num, 0.0), (right_num, page_w)):
+                src_idx = local_map[local_num]
+                if src_idx is not None:
+                    out_page.merge_transformed_page(
+                        reader.pages[src_idx], Transformation().translate(x_offset, 0)
+                    )
+                # if src_idx is None (blank filler), leave that half blank
+    else:
+        sequence = booklet_page_sequence(n_padded, duplex=duplex)
+        for local_num in sequence:
+            src_idx = local_map[local_num]
+            if src_idx is None:
+                writer.add_blank_page(width=page_w, height=page_h)
+            else:
+                writer.add_page(reader.pages[src_idx])
 
     with open(out_path, "wb") as f:
         writer.write(f)
@@ -140,8 +185,14 @@ def build_signature_pdf(reader, start, end, duplex, out_path):
 
 
 def build_cover_sleeve_pdf(
-    reader, cover_front_idx, inner_front_idx, inner_back_idx, cover_back_idx,
-    spine_width_pt, duplex, out_path,
+    reader,
+    cover_front_idx,
+    inner_front_idx,
+    inner_back_idx,
+    cover_back_idx,
+    spine_width_pt,
+    duplex,
+    out_path,
 ):
     """Build a 2-page wraparound cover sleeve PDF.
 
@@ -164,7 +215,8 @@ def build_cover_sleeve_pdf(
         reader.pages[cover_back_idx], Transformation().translate(0, 0)
     )
     outside.merge_transformed_page(
-        reader.pages[cover_front_idx], Transformation().translate(page_w + spine_width_pt, 0)
+        reader.pages[cover_front_idx],
+        Transformation().translate(page_w + spine_width_pt, 0),
     )
 
     # Inside: panel order depends on which edge the printer flips on
@@ -177,7 +229,8 @@ def build_cover_sleeve_pdf(
         reader.pages[left_page_idx], Transformation().translate(0, 0)
     )
     inside.merge_transformed_page(
-        reader.pages[right_page_idx], Transformation().translate(page_w + spine_width_pt, 0)
+        reader.pages[right_page_idx],
+        Transformation().translate(page_w + spine_width_pt, 0),
     )
 
     with open(out_path, "wb") as f:
@@ -249,6 +302,15 @@ def main():
         "Match this to the thickness of your sewn stack of signatures. "
         "Default: 10.0",
     )
+    parser.add_argument(
+        "--imposed",
+        "-i",
+        action="store_true",
+        help="Combine two source pages directly onto each output page "
+        "(e.g. two A5 pages onto one A4-sized output page), instead of "
+        "relying on your print dialog's own 'pages per sheet' option. "
+        "Off by default.",
+    )
     args = parser.parse_args()
 
     if args.signature_size % 4 != 0:
@@ -276,6 +338,7 @@ def main():
     instructions.append(f"Total pages: {total_pages}")
     instructions.append(f"Signature size: {args.signature_size}")
     instructions.append(f"Duplex mode: {args.duplex}-edge flip")
+    instructions.append(f"Imposed (2-up) output: {'yes' if args.imposed else 'no'}")
 
     body_start = 1
     body_end = total_pages
@@ -292,10 +355,10 @@ def main():
             )
             sys.exit(1)
 
-        cover_front_idx = 0            # page 1
-        inner_front_idx = 1            # page 2
-        inner_back_idx = total_pages - 2   # second-to-last page
-        cover_back_idx = total_pages - 1   # last page
+        cover_front_idx = 0  # page 1
+        inner_front_idx = 1  # page 2
+        inner_back_idx = total_pages - 2  # second-to-last page
+        cover_back_idx = total_pages - 1  # last page
 
         body_start = 3
         body_end = total_pages - 2
@@ -352,7 +415,7 @@ def main():
         )
         instructions.append("")
 
-        print(f"Cover sleeve: cover_sleeve.pdf")
+        print("Cover sleeve: cover_sleeve.pdf")
         print(f"  {fit_msg}")
 
     chunks = chunk_pages(body_end - body_start + 1, args.signature_size)
@@ -362,11 +425,23 @@ def main():
     instructions.append(f"Number of interior signatures: {len(chunks)}")
     instructions.append("")
     instructions.append("PRINT SETTINGS TO USE FOR EACH SIGNATURE FILE:")
-    instructions.append("  - Pages per sheet: 2")
-    instructions.append("  - Page order: horizontal / left-to-right")
-    instructions.append("  - Two-sided printing: ON")
     flip_label = "long edge (standard)" if args.duplex == "long" else "short edge"
-    instructions.append(f"  - Flip on: {flip_label}")
+    if args.imposed:
+        instructions.append(
+            "  - Pages are already imposed: each output page contains two "
+            "source pages side by side (e.g. two A5 pages on one A4-sized "
+            "output page). Do NOT set 'pages per sheet' in the print dialog."
+        )
+        instructions.append(
+            "  - Print at actual size / 100% (no 'fit to page' scaling)."
+        )
+        instructions.append("  - Two-sided printing: ON")
+        instructions.append(f"  - Flip on: {flip_label}")
+    else:
+        instructions.append("  - Pages per sheet: 2")
+        instructions.append("  - Page order: horizontal / left-to-right")
+        instructions.append("  - Two-sided printing: ON")
+        instructions.append(f"  - Flip on: {flip_label}")
     instructions.append("")
     instructions.append(
         "ASSEMBLY ORDER: after printing and cutting each signature's stack of "
@@ -388,11 +463,13 @@ def main():
         out_name = f"signature_{idx:02d}_pages_{start:03d}-{end:03d}.pdf"
         out_path = os.path.join(args.output_dir, out_name)
         n_real, n_blank, n_padded = build_signature_pdf(
-            reader, start, end, args.duplex, out_path
+            reader, start, end, args.duplex, out_path, imposed=args.imposed
         )
         line = f"Signature {idx:02d}: source pages {start}-{end} ({n_real} pages)"
         if n_blank:
-            line += f" + {n_blank} blank filler page(s) padded to {n_padded} -> {out_name}"
+            line += (
+                f" + {n_blank} blank filler page(s) padded to {n_padded} -> {out_name}"
+            )
         else:
             line += f" -> {out_name}"
         instructions.append(line)
