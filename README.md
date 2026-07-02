@@ -1,4 +1,4 @@
-# booklet-signatures
+# KISD-Booklet
 
 Split a large, normally-sorted PDF (page 1, 2, 3, ...) into multiple saddle-stitch "signatures" (mini zines, e.g. 16 pages each), and reorder the pages of each signature into correct fold/imposition order.
 
