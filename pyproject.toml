@@ -1,0 +1,16 @@
+[project]
+name = "booklet-signatures"
+version = "0.1.0"
+description = "Split a large PDF into saddle-stitch signatures (mini zines) with pages reordered for correct fold order"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pypdf>=5.9.0",
+]
+
+[project.scripts]
+booklet-signatures = "booklet_signatures:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
